@@ -1,0 +1,592 @@
+#include <Arduino.h>
+#include "painlessMesh.h"
+#include <ArduinoJson.h>
+#include <WiFi.h>
+
+const bool ROLE_ROOT = true;      
+
+#define MESH_PREFIX    "NO_ROUTER_TEST"
+#define MESH_PASSWORD  "meshpasswort"
+#define MESH_PORT      5555
+
+#define PACKET_COUNT        50
+#define PAYLOAD_SIZE        200
+#define SEND_INTERVAL_MS    100
+
+#define RX_PROGRESS_REPORT_MS 100
+#define ROOT_START_DELAY_MS     30000
+#define ROOT_RESULT_TIMEOUT_MS  10000
+#define RX_IDLE_TIMEOUT_MS      1500
+#define ROOT_STAGNATION_MS      500
+#define ROOT_SAME_COUNT_LIMIT   4
+#define TOPO_PRINT_MS           30000
+#define ROOT_ANNOUNCE_MS        20000
+
+Scheduler scheduler;
+painlessMesh mesh;
+
+uint32_t rootId = 0;
+uint32_t nextTestId = 1;
+
+bool testActive = false;
+uint32_t activeTestId = 0;
+uint32_t testStartMs = 0;
+
+bool senderSummaryReceived = false;
+bool receiverSummaryReceived = false;
+uint32_t sameReceiverCount = 0;
+uint32_t lastReceiverPackets = 0;
+uint32_t lastReceiverProgressMs = 0;
+uint32_t lastReceiverRealProgressMs = 0;
+
+struct SenderSummary {
+  uint32_t testId = 0;
+  uint32_t sender = 0;
+  uint32_t receiver = 0;
+  uint16_t packetCount = 0;
+  uint16_t payloadSize = 0;
+  uint32_t sentPackets = 0;
+  uint32_t sentBytes = 0;
+  uint32_t startMs = 0;
+  uint32_t endMs = 0;
+};
+
+struct ReceiverSummary {
+  uint32_t testId = 0;
+  uint32_t sender = 0;
+  uint32_t receiver = 0;
+  uint16_t expectedPackets = 0;
+  uint16_t payloadSize = 0;
+  uint32_t receivedPackets = 0;
+  uint32_t receivedBytes = 0;
+  uint32_t firstRxMs = 0;
+  uint32_t lastRxMs = 0;
+};
+
+SenderSummary senderSummary;
+ReceiverSummary receiverSummary;
+
+struct ReceiverState {
+  bool active = false;
+  bool summarySent = false;
+  uint32_t lastProgressMs = 0;
+  uint32_t testId = 0;
+  uint32_t sender = 0;
+  uint32_t receiver = 0;
+  uint32_t root = 0;
+  uint16_t expectedPackets = 0;
+  uint16_t payloadSize = 0;
+  uint32_t receivedPackets = 0;
+  uint32_t receivedBytes = 0;
+  uint32_t firstRxMs = 0;
+  uint32_t lastRxMs = 0;
+};
+
+ReceiverState rx;
+
+void rootTriggerTask();
+void printTopologyTask();
+void rootAnnounceTask();
+void printResultIfReady(bool force);
+void sendReceiverSummary(bool finalSummary);
+
+Task tRootTrigger(ROOT_START_DELAY_MS, TASK_ONCE, &rootTriggerTask);
+Task tTopology(TOPO_PRINT_MS, TASK_FOREVER, &printTopologyTask);
+Task tRootAnnounce(ROOT_ANNOUNCE_MS, TASK_FOREVER, &rootAnnounceTask);
+
+String makePayload(uint16_t len, uint16_t seq) {
+  String p;
+  p.reserve(len);
+  char c = 'A' + (seq % 26);
+  for (uint16_t i = 0; i < len; i++) p += c;
+  return p;
+}
+
+void resetRootTestState() {
+  senderSummary = SenderSummary();
+  receiverSummary = ReceiverSummary();
+  senderSummaryReceived = false;
+  receiverSummaryReceived = false;
+  sameReceiverCount = 0;
+  lastReceiverPackets = 0;
+  lastReceiverProgressMs = 0;
+  lastReceiverRealProgressMs = 0;
+}
+
+bool chooseRandomSenderReceiver(uint32_t &sender, uint32_t &receiver) {
+  SimpleList<uint32_t> nodes = mesh.getNodeList();
+  uint32_t count = nodes.size();
+
+  if (count < 2) return false;
+
+  uint32_t senderIndex = random(count);
+  uint32_t receiverIndex = random(count);
+  while (receiverIndex == senderIndex) receiverIndex = random(count);
+
+  uint32_t i = 0;
+  for (auto &&id : nodes) {
+    if (i == senderIndex) sender = id;
+    if (i == receiverIndex) receiver = id;
+    i++;
+  }
+
+  return sender != 0 && receiver != 0 && sender != receiver;
+}
+
+void sendJson(uint32_t target, JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  mesh.sendSingle(target, out);
+}
+
+void rootAnnounceTask() {
+  if (!ROLE_ROOT) return;
+
+  StaticJsonDocument<128> doc;
+  doc["type"] = "ROOT";
+  doc["root"] = mesh.getNodeId();
+
+  String out;
+  serializeJson(doc, out);
+  mesh.sendBroadcast(out);
+}
+
+void printTopologyTask() {
+  Serial.println();
+  Serial.printf("[NODE] myNodeId=%u rootKnown=%u connections=%u\n",
+                mesh.getNodeId(), rootId, mesh.getNodeList().size());
+
+  if (!ROLE_ROOT) return;
+
+  Serial.printf("[NODES] count=%u\n", mesh.getNodeList().size());
+  uint32_t i = 1;
+  for (auto &&id : mesh.getNodeList()) {
+    Serial.printf("%u: nodeId=%u connected=%s\n", i++, id, 
+    mesh.isConnected(id) ? "yes" : "unknown/mesh-route");
+  }
+}
+
+void rootTriggerTask() {
+  if (!ROLE_ROOT) return;
+
+  uint32_t sender = 0;
+  uint32_t receiver = 0;
+
+  if (!chooseRandomSenderReceiver(sender, receiver)) {
+    Serial.println("[ROOT] not enough nodes for random test");
+    tRootTrigger.setInterval(5000);
+    tRootTrigger.restartDelayed();
+    return;
+  }
+
+  uint32_t testId = nextTestId++;
+
+  StaticJsonDocument<256> doc;
+  doc["type"] = "TRIGGER";
+  doc["test_id"] = testId;
+  doc["root"] = mesh.getNodeId();
+  doc["sender"] = sender;
+  doc["receiver"] = receiver;
+  doc["packets"] = PACKET_COUNT;
+  doc["payload"] = PAYLOAD_SIZE;
+  doc["interval"] = SEND_INTERVAL_MS;
+  doc["timeout"] = RX_IDLE_TIMEOUT_MS;
+
+  Serial.println();
+  Serial.println("[TRIGGER]");
+  Serial.printf("test_id=%u sender=%u receiver=%u packets=%u payload=%u interval=%u ms timeout=%u ms\n",
+                testId, sender, receiver, PACKET_COUNT, PAYLOAD_SIZE,
+                SEND_INTERVAL_MS, RX_IDLE_TIMEOUT_MS);
+
+  resetRootTestState();
+  testActive = true;
+  activeTestId = testId;
+  testStartMs = millis();
+  lastReceiverProgressMs = testStartMs;
+  lastReceiverRealProgressMs = testStartMs;
+
+  sendJson(sender, doc);
+  tRootTrigger.disable();
+}
+
+void startSending(JsonDocument &doc) {
+  uint32_t testId = doc["test_id"];
+  uint32_t root = doc["root"];
+  uint32_t sender = doc["sender"];
+  uint32_t receiver = doc["receiver"];
+  uint16_t packets = doc["packets"];
+  uint16_t payloadSize = doc["payload"];
+  uint16_t interval = doc["interval"];
+
+  Serial.println();
+  Serial.printf("[SENDER] trigger received test_id=%u receiver=%u packets=%u payload=%u\n",
+                testId, receiver, packets, payloadSize);
+
+  SenderSummary s;
+  s.testId = testId;
+  s.sender = sender;
+  s.receiver = receiver;
+  s.packetCount = packets;
+  s.payloadSize = payloadSize;
+  s.startMs = millis();
+
+  for (uint16_t i = 1; i <= packets; i++) {
+    StaticJsonDocument<2200> data;
+    data["type"] = "DATA";
+    data["test_id"] = testId;
+    data["root"] = root;
+    data["sender"] = sender;
+    data["receiver"] = receiver;
+    data["seq"] = i;
+    data["expected"] = packets;
+    data["payload_size"] = payloadSize;
+    data["data"] = makePayload(payloadSize, i);
+
+    String out;
+    serializeJson(data, out);
+
+    bool ok = mesh.sendSingle(receiver, out);
+    if (ok) {
+      s.sentPackets++;
+      s.sentBytes += payloadSize;
+    }
+    if (i == 1 || i % 10 == 0 || i == packets) {
+      Serial.printf("[SENDER] DATA seq=%u/%u -> receiver=%u send=%s\n",
+                    i, packets, receiver, ok ? "OK" : "FAIL");
+    }
+    delay(interval);
+    mesh.update();
+  }
+
+  s.endMs = millis();
+
+  StaticJsonDocument<256> summary;
+  summary["type"] = "SENDER_SUMMARY";
+  summary["test_id"] = s.testId;
+  summary["sender"] = s.sender;
+  summary["receiver"] = s.receiver;
+  summary["packets"] = s.packetCount;
+  summary["payload"] = s.payloadSize;
+  summary["sent_packets"] = s.sentPackets;
+  summary["sent_bytes"] = s.sentBytes;
+  summary["start"] = s.startMs;
+  summary["end"] = s.endMs;
+
+  for (uint8_t i = 1; i <= 3; i++) {
+    sendJson(root, summary);
+    Serial.printf("[SENDER] summary -> root=%u repeat=%u\n", root, i);
+    delay(20);
+    mesh.update();
+  }
+}
+
+void handleData(JsonDocument &doc) {
+  uint32_t testId = doc["test_id"];
+  uint32_t seq = doc["seq"];
+  uint32_t root = doc["root"];
+  uint32_t sender = doc["sender"];
+  uint32_t receiver = doc["receiver"];
+  uint16_t expected = doc["expected"];
+  uint16_t payloadSize = doc["payload_size"];
+  const char *data = doc["data"] | "";
+  uint32_t now = millis();
+
+  if (!rx.active || rx.testId != testId) {
+    rx = ReceiverState();
+    rx.active = true;
+    rx.testId = testId;
+    rx.root = root;
+    rx.sender = sender;
+    rx.receiver = receiver;
+    rx.expectedPackets = expected;
+    rx.payloadSize = payloadSize;
+    rx.firstRxMs = now;
+    rx.lastRxMs = now;
+    rx.lastProgressMs = now;
+
+    Serial.println();
+    Serial.printf("[RECEIVER] new test_id=%u from sender=%u expected=%u payload=%u\n",
+                  testId, sender, expected, payloadSize);
+  }
+
+  if (rx.receivedPackets == 0) rx.firstRxMs = now;
+  rx.lastRxMs = now;
+  rx.receivedPackets++;
+  rx.receivedBytes += strlen(data);
+
+  if (seq == 1 || seq % 10 == 0 || seq == expected) {
+    Serial.printf("[RECEIVER] DATA seq=%u packets=%u/%u bytes=%u\n",
+                  seq, rx.receivedPackets, expected, rx.receivedBytes);
+  }
+
+  if (!rx.summarySent && rx.receivedPackets >= rx.expectedPackets) {
+    sendReceiverSummary(true);
+  }
+}
+
+void sendReceiverSummary(bool finalSummary) {
+  if (!rx.active || rx.root == 0) return;
+
+  StaticJsonDocument<256> doc;
+  doc["type"] = "RECEIVER_SUMMARY";
+  doc["test_id"] = rx.testId;
+  doc["sender"] = rx.sender;
+  doc["receiver"] = rx.receiver;
+  doc["expected"] = rx.expectedPackets;
+  doc["payload"] = rx.payloadSize;
+  doc["received_packets"] = rx.receivedPackets;
+  doc["received_bytes"] = rx.receivedBytes;
+  doc["first"] = rx.firstRxMs;
+  doc["last"] = rx.lastRxMs;
+
+  uint8_t repeats = finalSummary ? 3 : 1;
+  for (uint8_t i = 1; i <= repeats; i++) {
+    sendJson(rx.root, doc);
+    if (finalSummary) {
+      Serial.printf("[RECEIVER] final summary -> root=%u repeat=%u packets=%u/%u\n",
+                    rx.root, i, rx.receivedPackets, rx.expectedPackets);
+    }
+    delay(20);
+    mesh.update();
+  }
+
+  if (finalSummary) rx.summarySent = true;
+}
+
+void receiverTimeoutCheck() {
+  if (!rx.active || rx.summarySent) return;
+
+  uint32_t now = millis();
+
+  if (now - rx.lastProgressMs >= RX_PROGRESS_REPORT_MS) {
+    sendReceiverSummary(false);
+    rx.lastProgressMs = now;
+  }
+
+  if (now - rx.lastRxMs >= RX_IDLE_TIMEOUT_MS) {
+    sendReceiverSummary(true);
+  }
+}
+
+void handleSenderSummary(JsonDocument &doc) {
+  if (!ROLE_ROOT) return;
+  if ((uint32_t)doc["test_id"] != activeTestId) return;
+
+  senderSummaryReceived = true;
+  senderSummary.testId = doc["test_id"];
+  senderSummary.sender = doc["sender"];
+  senderSummary.receiver = doc["receiver"];
+  senderSummary.packetCount = doc["packets"];
+  senderSummary.payloadSize = doc["payload"];
+  senderSummary.sentPackets = doc["sent_packets"];
+  senderSummary.sentBytes = doc["sent_bytes"];
+  senderSummary.startMs = doc["start"];
+  senderSummary.endMs = doc["end"];
+
+  Serial.printf("[ROOT] sender summary received for test_id=%u\n", senderSummary.testId);
+}
+
+void handleReceiverSummary(JsonDocument &doc) {
+  if (!ROLE_ROOT) return;
+  if ((uint32_t)doc["test_id"] != activeTestId) return;
+
+  ReceiverSummary r;
+  r.testId = doc["test_id"];
+  r.sender = doc["sender"];
+  r.receiver = doc["receiver"];
+  r.expectedPackets = doc["expected"];
+  r.payloadSize = doc["payload"];
+  r.receivedPackets = doc["received_packets"];
+  r.receivedBytes = doc["received_bytes"];
+  r.firstRxMs = doc["first"];
+  r.lastRxMs = doc["last"];
+
+  uint32_t now = millis();
+
+  if (!receiverSummaryReceived || r.receivedPackets > receiverSummary.receivedPackets) {
+    receiverSummaryReceived = true;
+    receiverSummary = r;
+    lastReceiverPackets = r.receivedPackets;
+    lastReceiverProgressMs = now;
+    lastReceiverRealProgressMs = now;
+    sameReceiverCount = 0;
+  } else if (r.receivedPackets == lastReceiverPackets) {
+    sameReceiverCount++;
+    lastReceiverProgressMs = now;
+  }
+
+  Serial.printf("[ROOT] receiver summary received for test_id=%u packets=%u/%u same=%u\n",
+                r.testId, r.receivedPackets, r.expectedPackets, sameReceiverCount);
+}
+
+void printResultIfReady(bool force) {
+  if (!ROLE_ROOT || !testActive) return;
+
+  uint32_t now = millis();
+  uint32_t elapsed = now - testStartMs;
+
+  bool timeout = elapsed >= ROOT_RESULT_TIMEOUT_MS;
+  bool receiverComplete = receiverSummaryReceived &&
+                          receiverSummary.receivedPackets >= receiverSummary.expectedPackets;
+  bool stagnated = receiverSummaryReceived &&
+                   ((now - lastReceiverProgressMs) >= ROOT_STAGNATION_MS ||
+                    sameReceiverCount >= ROOT_SAME_COUNT_LIMIT);
+  bool complete = senderSummaryReceived && receiverComplete;
+
+  if (!force && !timeout && !stagnated && !complete) return;
+
+  if (!senderSummaryReceived && !receiverSummaryReceived) {
+    Serial.println();
+    Serial.println("========== TEST RESULT ==========");
+    Serial.printf("Test-ID:                 %u\n", activeTestId);
+    Serial.println("Status:                  NO_SUMMARIES");
+    Serial.println("Reason:                  Neither sender nor receiver summary reached root");
+    Serial.println("=================================");
+    testActive = false;
+    tRootTrigger.setInterval(5000);
+    tRootTrigger.restartDelayed();
+    return;
+  }
+
+  uint32_t sentPackets = senderSummary.sentPackets;
+  uint32_t receivedPackets = receiverSummaryReceived ? receiverSummary.receivedPackets : 0;
+  uint32_t sentBytes = senderSummary.sentBytes;
+  uint32_t receivedBytes = receiverSummaryReceived ? receiverSummary.receivedBytes : 0;
+  uint32_t lostPackets = sentPackets >= receivedPackets ? sentPackets - receivedPackets : 0;
+  float pdr = sentPackets > 0 ? ((float)receivedPackets / sentPackets) * 100.0f : 0.0f;
+
+  float senderDuration = senderSummary.endMs > senderSummary.startMs ? senderSummary.endMs - senderSummary.startMs : 0.0f;
+  float receiverDuration = receiverSummary.lastRxMs > receiverSummary.firstRxMs ? receiverSummary.lastRxMs - receiverSummary.firstRxMs : 0.0f;
+  float rootDurationRaw = elapsed;
+  float rootDurationEffective = lastReceiverRealProgressMs > testStartMs ? lastReceiverRealProgressMs - testStartMs : rootDurationRaw;
+
+  float goodputRx = receiverDuration > 0 ? ((float)receivedBytes * 8.0f) / (receiverDuration / 1000.0f) / 1000.0f : 0.0f;
+  float goodputRoot = rootDurationEffective > 0 ? ((float)receivedBytes * 8.0f) / (rootDurationEffective / 1000.0f) / 1000.0f : 0.0f;
+
+  Serial.println();
+  Serial.println("========== TEST RESULT ==========");
+  Serial.printf("Test-ID:                 %u\n", activeTestId);
+  Serial.printf("Sender:                  %u\n", senderSummary.sender ? senderSummary.sender : receiverSummary.sender);
+  Serial.printf("Receiver:                %u\n", senderSummary.receiver ? senderSummary.receiver : receiverSummary.receiver);
+  Serial.printf("Burst packets:           %u\n", senderSummary.packetCount ? senderSummary.packetCount : receiverSummary.expectedPackets);
+  Serial.printf("Payload per packet:      %u bytes\n", senderSummary.payloadSize ? senderSummary.payloadSize : receiverSummary.payloadSize);
+  Serial.printf("Sent packets:            %u\n", sentPackets);
+
+  if (receiverSummaryReceived) {
+    Serial.printf("Received packets:        %u\n", receivedPackets);
+    Serial.printf("Lost packets:            %u\n", lostPackets);
+    Serial.printf("PDR:                     %.2f %%\n", pdr);
+    Serial.printf("Sent bytes:              %u\n", sentBytes);
+    Serial.printf("Received bytes:          %u\n", receivedBytes);
+    Serial.printf("Sender duration:         %.2f ms\n", senderDuration);
+    Serial.printf("Receiver duration:       %.2f ms\n", receiverDuration);
+    Serial.printf("Goodput (receiver-based): %.2f kbps\n", goodputRx);
+    Serial.printf("Root duration raw:         %.2f ms\n", rootDurationRaw);
+    Serial.printf("Root duration effective:   %.2f ms\n", rootDurationEffective);
+    Serial.printf("Goodput (root-window):     %.2f kbps\n", goodputRoot);
+  } else {
+    Serial.println("Received packets:        unknown (no receiver summary)");
+    Serial.println("Lost packets:            unknown");
+    Serial.println("PDR:                     unknown");
+    Serial.printf("Sent bytes:              %u\n", sentBytes);
+    Serial.println("Received bytes:          unknown");
+    Serial.printf("Sender duration:         %.2f ms\n", senderDuration);
+    Serial.println("Receiver duration:       unknown");
+    Serial.println("Goodput:                 unknown");
+  }
+
+  const char *status = "TIMEOUT";
+  if (complete) status = "COMPLETE";
+  else if (!receiverSummaryReceived && senderSummaryReceived && timeout) status = "NO_RECEIVER_SUMMARY";
+  else if (stagnated && senderSummaryReceived) status = "STAGNATED";
+  else if (stagnated && !senderSummaryReceived) status = "STAGNATED_NO_SENDER_SUMMARY";
+
+  Serial.printf("Status:                  %s\n", status);
+  Serial.println("Path:                    painlessMesh internal auto-route; no root/tree path available");
+  Serial.println("=================================");
+  Serial.println();
+
+  testActive = false;
+  activeTestId = 0;
+  resetRootTestState();
+
+  uint32_t waitS = random(31);
+  Serial.printf("[ROOT] next random test in %u s\n", waitS);
+  tRootTrigger.setInterval(waitS * 1000UL + 1000UL);
+  tRootTrigger.restartDelayed();
+}
+
+void receivedCallback(uint32_t from, String &msg) {
+  DynamicJsonDocument doc(2500);
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) {
+    Serial.printf("[WARN] JSON error from=%u: %s\n", from, err.c_str());
+    return;}
+  const char *type = doc["type"] | "";
+  if (!strcmp(type, "ROOT")) {
+    rootId = doc["root"] | from;
+    return;}
+  if (!strcmp(type, "TRIGGER")) {
+    if ((uint32_t)doc["sender"] == mesh.getNodeId()) startSending(doc);
+    return;}
+  if (!strcmp(type, "DATA")) {
+    if ((uint32_t)doc["receiver"] == mesh.getNodeId()) handleData(doc);
+    return;}
+  if (!strcmp(type, "SENDER_SUMMARY")) {
+    handleSenderSummary(doc);
+    return;}
+  if (!strcmp(type, "RECEIVER_SUMMARY")) {
+    handleReceiverSummary(doc);
+    return;}
+}
+
+void newConnectionCallback(uint32_t nodeId) {
+  Serial.printf("[MESH] new connection: nodeId=%u\n", nodeId);
+}
+
+void changedConnectionCallback() {
+  Serial.printf("[MESH] changed connections, count=%u\n", mesh.getNodeList().size());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  randomSeed(esp_random());
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("painlessMesh Random Measurement");
+  Serial.printf("Role: %s\n", ROLE_ROOT ? "ROOT" : "NODE");
+  Serial.println("=================================");
+
+  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
+
+  mesh.init(MESH_PREFIX, MESH_PASSWORD, &scheduler, MESH_PORT);
+
+  mesh.onReceive(&receivedCallback);
+
+  mesh.onNewConnection(&newConnectionCallback);
+  mesh.onChangedConnections(&changedConnectionCallback);
+
+  rootId = ROLE_ROOT ? mesh.getNodeId() : 0;
+
+  scheduler.addTask(tTopology);
+  tTopology.enable();
+
+  if (ROLE_ROOT) {
+    scheduler.addTask(tRootAnnounce);
+    tRootAnnounce.enable();
+
+    scheduler.addTask(tRootTrigger);
+    tRootTrigger.enableDelayed(ROOT_START_DELAY_MS);
+  }
+
+  Serial.printf("[START] myNodeId=%u\n", mesh.getNodeId());
+}
+
+void loop() {
+  mesh.update();
+  receiverTimeoutCheck();
+  printResultIfReady(false);
+}

@@ -1,0 +1,1321 @@
+/*
+ * SPDX-FileCopyrightText: 2022-2024 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <inttypes.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include <sys/socket.h>
+#include <sys/param.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include "esp_netif.h"
+#include "esp_mac.h"
+#include "esp_bridge.h"
+#include "esp_mesh_lite.h"
+#include <errno.h>
+
+static const char *TAG = "no_router";
+#define UDP_PORT            5001
+#define ROOT_IP "192.168.5.1"
+#define FLOW_LEFT   0
+#define FLOW_RIGHT  1
+#define FLOW_COUNT  2
+#if CONFIG_MESH_ROOT
+static const uint8_t LEFT_SENDER_MAC[6]   = {0x74,0x4D,0xBD,0xA0,0x38,0x55};
+static const uint8_t LEFT_RECEIVER_MAC[6] = {0x74,0x4D,0xBD,0xA0,0x64,0x19};
+static const uint8_t RIGHT_SENDER_MAC[6]  = {0x74,0x4D,0xBD,0xA0,0x30,0x65};
+static const uint8_t RIGHT_RECEIVER_MAC[6]= {0x74,0x4D,0xBD,0xA1,0xAD,0xAD};
+#endif
+#define MSG_TYPE_TRIGGER            1
+#define MSG_TYPE_DATA               2
+#define MSG_TYPE_SENDER_SUMMARY     3
+#define MSG_TYPE_RECEIVER_SUMMARY   4
+#define MSG_TYPE_TOPO_REPLY         5
+
+static uint32_t next_test_id = 1;
+static bool test_active = false;
+static uint32_t active_test_id = 0;
+static int64_t test_start_us = 0;
+static int64_t parallel_test_end_us = 0;
+
+#define ROOT_RESULT_TIMEOUT_MS     10000
+#define RX_IDLE_TIMEOUT_MS         1500
+#define RX_PROGRESS_REPORT_MS      100
+#define ROOT_STAGNATION_MS         500
+#define ROOT_SAME_COUNT_LIMIT      4
+
+static bool sender_summary_received[FLOW_COUNT] = {0};
+static bool receiver_summary_received[FLOW_COUNT] = {0};
+
+static uint32_t last_receiver_packets[FLOW_COUNT] = {0};
+static int64_t last_receiver_progress_us[FLOW_COUNT] = {0};
+static uint32_t same_receiver_count[FLOW_COUNT] = {0};
+static int64_t root_flow_first_seen_us[FLOW_COUNT] = {0};
+static int64_t root_flow_complete_us[FLOW_COUNT] = {0};
+static void print_test_result_if_ready(bool force);
+static void reset_receiver_state(void);
+static void try_send_receiver_summary_on_timeout(void);
+static void send_receiver_progress_summary(bool final_summary);
+static void send_topology_reply_to_root(void);
+static int find_topology_index_by_ip(uint32_t ip);
+static int find_topology_index_by_mac(const uint8_t mac[6]);
+static int build_path_to_mac(const uint8_t mac[6], uint32_t path_ips[8], uint8_t *path_len);
+static bool am_i_root(void);
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t  type;
+    uint8_t  reserved[3];
+    uint32_t seq;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t payload_len;
+    char     payload[600];
+} app_msg_t;
+
+static size_t app_msg_size(uint16_t payload_len)
+{
+    return sizeof(app_msg_t) - sizeof(((app_msg_t *)0)->payload) + payload_len;
+}
+
+typedef struct __attribute__((packed)) {
+    uint32_t test_id;
+    uint8_t  flow_id;
+    uint8_t  reserved2[3];
+    uint32_t sender_ip;
+    uint32_t receiver_ip;
+    uint16_t packet_count;
+    uint16_t payload_size;
+    uint16_t send_interval_ms;
+    uint16_t result_timeout_ms;
+    uint8_t  path_len;
+    uint8_t  current_hop;
+    uint32_t path_ips[8];
+    uint8_t  data_path_len;
+    uint32_t data_path_ips[8];
+} trigger_msg_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t test_id;
+    uint8_t  flow_id;
+    uint8_t  reserved2[3];
+    uint32_t sender_ip;
+    uint32_t receiver_ip;
+    uint16_t packet_count;
+    uint16_t payload_size;
+    uint32_t sent_packets;
+    uint32_t sent_bytes;
+    uint64_t send_start_us;
+    uint64_t send_end_us;
+} sender_summary_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t test_id;
+    uint8_t  flow_id;
+    uint8_t  reserved2[3];
+    uint32_t sender_ip;
+    uint32_t receiver_ip;
+    uint16_t expected_packets;
+    uint16_t payload_size;
+    uint32_t received_packets;
+    uint32_t received_bytes;
+    uint64_t first_rx_us;
+    uint64_t last_rx_us;
+} receiver_summary_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t test_id;
+    uint8_t  flow_id;
+    uint8_t  reserved2[3];
+    uint16_t expected_packets;
+    uint16_t payload_size;
+    uint32_t seq;
+    uint32_t root_ip;
+    uint16_t result_timeout_ms;
+    uint8_t  path_len;
+    uint8_t  current_hop;
+    uint32_t path_ips[8];
+} data_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t node_ip;
+    uint8_t  node_mac[6];
+    uint8_t  parent_bssid[6];
+    uint8_t  level;
+    int8_t   parent_rssi;
+} topo_reply_t;
+
+static sender_summary_t g_sender_summary[FLOW_COUNT];
+static receiver_summary_t g_best_receiver_summary[FLOW_COUNT];
+
+typedef struct {
+    bool     valid;
+    uint32_t ip;
+    uint8_t  mac[6];
+    uint8_t  parent_bssid[6];
+    uint8_t  level;
+    int8_t   parent_rssi;
+} topo_entry_t;
+
+static topo_entry_t g_topology[32];
+static uint32_t g_topology_count = 0;
+
+static struct {
+    bool active;
+    bool summary_sent;
+    uint32_t test_id;
+    uint8_t  flow_id;
+    uint32_t sender_ip;
+    uint32_t receiver_ip;
+    uint32_t root_ip;
+    uint16_t expected_packets;
+    uint16_t payload_size;
+    uint16_t result_timeout_ms;
+    uint32_t received_packets;
+    uint32_t received_bytes;
+    int64_t first_rx_us;
+    int64_t last_rx_us;
+    int64_t last_progress_report_us;
+} g_rx_state = {0};
+
+static void print_system_info_timercb(TimerHandle_t timer)
+{
+    uint32_t size = 0;
+    const node_info_list_t *node = esp_mesh_lite_get_nodes_list(&size);
+    if (am_i_root()) {
+        printf("\n[NODES] count=%lu\n", (unsigned long)size);
+        for (uint32_t i = 0; i < size && node != NULL; i++, node = node->next) {
+            if (node->node == NULL) {
+                continue;
+            }
+            struct in_addr ip_struct;
+            ip_struct.s_addr = node->node->ip_addr;
+            printf("%lu: lvl=%d mac=" MACSTR " ip=%s\n",
+                   (unsigned long)(i + 1),
+                   node->node->level,
+                   MAC2STR(node->node->mac_addr),
+                   inet_ntoa(ip_struct));
+            int idx = find_topology_index_by_mac(node->node->mac_addr);
+
+if (idx < 0 && g_topology_count < 32) {
+    idx = (int)g_topology_count++;
+}
+
+if (idx >= 0) {
+    g_topology[idx].valid = true;
+    g_topology[idx].ip = node->node->ip_addr;
+    memcpy(g_topology[idx].mac, node->node->mac_addr, 6);
+    g_topology[idx].level = node->node->level;
+}
+        }
+    }
+    if (!test_active) {
+        send_topology_reply_to_root();
+    }
+}
+
+static int udp_send_raw(uint32_t dst_ip_nbo, uint16_t port, const void *data, size_t len)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "socket failed: errno=%d", errno);
+        return -1;
+    }
+    struct sockaddr_in dest_addr = {0};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    dest_addr.sin_addr.s_addr = dst_ip_nbo;
+    int err = sendto(sock, data, len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    close(sock);
+    if (err < 0) {
+        ESP_LOGE(TAG, "sendto failed: errno=%d", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static int udp_send_raw_with_sock(int sock, uint32_t dst_ip_nbo, uint16_t port, const void *data, size_t len)
+{
+    struct sockaddr_in dest_addr = {0};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    dest_addr.sin_addr.s_addr = dst_ip_nbo;
+    int err = sendto(sock, data, len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0) {
+        ESP_LOGE(TAG, "sendto failed: errno=%d", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t get_my_ip_nbo(void)
+{
+    esp_netif_ip_info_t ip_info = {0};
+    esp_netif_t *sta_netif =
+    esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+        return ip_info.ip.addr;
+    }
+    return 0;
+}
+
+static bool am_i_root(void)
+{
+#if CONFIG_MESH_ROOT
+    return true;
+#else
+    return false;
+#endif
+}
+     
+static void ensure_root_in_topology(void)
+{
+    uint8_t root_mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_AP, root_mac);
+    int idx = find_topology_index_by_ip(inet_addr(ROOT_IP));
+    if (idx < 0 && g_topology_count < 32) {
+        idx = (int)g_topology_count++;
+    }
+    if (idx >= 0) {
+        g_topology[idx].valid = true;
+        g_topology[idx].ip = inet_addr(ROOT_IP);
+        memcpy(g_topology[idx].mac, root_mac, 6);
+        memset(g_topology[idx].parent_bssid, 0, 6);
+        g_topology[idx].level = 1;
+        g_topology[idx].parent_rssi = 0;
+    }
+}
+
+static int find_topology_index_by_ip(uint32_t ip)
+{
+    for (uint32_t i = 0; i < g_topology_count; i++) {
+        if (g_topology[i].valid && g_topology[i].ip == ip) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int find_topology_index_by_mac(const uint8_t mac[6])
+{
+    for (uint32_t i = 0; i < g_topology_count; i++) {
+        if (g_topology[i].valid && memcmp(g_topology[i].mac, mac, 6) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t get_ip_by_mac(const uint8_t mac[6])
+{
+    int idx = find_topology_index_by_mac(mac);
+
+    if (idx < 0) {
+        return 0;
+    }
+
+    return g_topology[idx].ip;
+}
+
+static void print_flow_mac_path(uint8_t flow)
+{
+#if CONFIG_MESH_ROOT
+    if (flow == FLOW_LEFT) {
+        printf("Logical path MAC:        " MACSTR " -> " MACSTR "\n",
+               MAC2STR(LEFT_SENDER_MAC),
+               MAC2STR(LEFT_RECEIVER_MAC));
+    } else {
+        printf("Logical path MAC:        " MACSTR " -> " MACSTR "\n",
+               MAC2STR(RIGHT_SENDER_MAC),
+               MAC2STR(RIGHT_RECEIVER_MAC));
+    }
+#endif
+}
+
+static int build_path_to_mac(const uint8_t mac[6], uint32_t path_ips[8], uint8_t *path_len)
+{
+    int idx = find_topology_index_by_mac(mac);
+
+    if (idx < 0) {
+        return -1;
+    }
+
+    int reverse_indices[8];
+    int reverse_len = 0;
+    int cur = idx;
+
+    while (cur >= 0 && reverse_len < 8) {
+        reverse_indices[reverse_len++] = cur;
+
+        if (g_topology[cur].level == 1) {
+            break;
+        }
+
+        cur = find_topology_index_by_mac(g_topology[cur].parent_bssid);
+    }
+
+    if (reverse_len <= 1) {
+        *path_len = 0;
+        return 0;
+    }
+
+    uint8_t out_len = 0;
+
+    for (int i = reverse_len - 2; i >= 0; i--) {
+        if (out_len < 8) {
+            path_ips[out_len++] = g_topology[reverse_indices[i]].ip;
+        }
+    }
+
+    *path_len = out_len;
+    return 0;
+}
+
+static void send_topology_reply_to_root(void)
+{
+    if (am_i_root()) {
+        return;
+    }
+    uint32_t my_ip = get_my_ip_nbo();
+    if (my_ip == 0) {
+        return;
+    }
+    topo_reply_t reply = {0};
+    wifi_ap_record_t ap_info = {0};
+    uint8_t self_mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_AP, self_mac);
+    reply.node_ip = my_ip;
+    memcpy(reply.node_mac, self_mac, 6);
+    reply.level = esp_mesh_lite_get_level();
+    reply.parent_rssi = -120;
+    if (esp_mesh_lite_get_level() > 1) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            memcpy(reply.parent_bssid, ap_info.bssid, 6);
+            reply.parent_rssi = ap_info.rssi;
+        }
+    }
+    app_msg_t reply_msg = {0};
+    reply_msg.magic = 0x4D455348;
+    reply_msg.type = MSG_TYPE_TOPO_REPLY;
+    reply_msg.src_ip = my_ip;
+    reply_msg.dst_ip = inet_addr(ROOT_IP);
+    reply_msg.payload_len = sizeof(reply);
+    memcpy(reply_msg.payload, &reply, sizeof(reply));
+    size_t tx_len = app_msg_size(reply_msg.payload_len);
+    udp_send_raw(inet_addr(ROOT_IP), UDP_PORT, &reply_msg, tx_len);
+}
+
+static void reset_receiver_state(void)
+{
+    memset(&g_rx_state, 0, sizeof(g_rx_state));
+}
+
+static void send_receiver_progress_summary(bool final_summary)
+{
+    if (!g_rx_state.active) {
+        return;
+    }
+    receiver_summary_t summary = {0};
+    summary.test_id = g_rx_state.test_id;
+    summary.flow_id = g_rx_state.flow_id;
+    summary.sender_ip = g_rx_state.sender_ip;
+    summary.receiver_ip = g_rx_state.receiver_ip;
+    summary.expected_packets = g_rx_state.expected_packets;
+    summary.payload_size = g_rx_state.payload_size;
+    summary.received_packets = g_rx_state.received_packets;
+    summary.received_bytes = g_rx_state.received_bytes;
+    summary.first_rx_us = g_rx_state.first_rx_us;
+    summary.last_rx_us = g_rx_state.last_rx_us;
+
+    app_msg_t summary_msg = {0};
+    summary_msg.magic = 0x4D455348;
+    summary_msg.type = MSG_TYPE_RECEIVER_SUMMARY;
+    summary_msg.src_ip = g_rx_state.receiver_ip;
+    summary_msg.dst_ip = g_rx_state.root_ip;
+    summary_msg.payload_len = sizeof(summary);
+    memcpy(summary_msg.payload, &summary, sizeof(summary));
+    size_t tx_len = app_msg_size(summary_msg.payload_len);
+    int repeat_count = final_summary ? 3 : 1;
+    for (int k = 0; k < repeat_count; k++) {
+    udp_send_raw(g_rx_state.root_ip, UDP_PORT, &summary_msg,
+    tx_len);
+    if (repeat_count > 1) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+    if (final_summary) {
+        g_rx_state.summary_sent = true;
+    }
+    g_rx_state.last_progress_report_us = esp_timer_get_time();
+}
+
+static void try_send_receiver_summary_on_timeout(void)
+{
+    if (!g_rx_state.active || g_rx_state.summary_sent) {
+        return;
+    }
+    int64_t now_us = esp_timer_get_time();
+    if ((now_us - g_rx_state.last_progress_report_us) >= (RX_PROGRESS_REPORT_MS * 1000)) {
+        send_receiver_progress_summary(false);
+    }
+    int64_t idle_ms = (now_us - g_rx_state.last_rx_us) / 1000;
+    uint16_t timeout_ms = g_rx_state.result_timeout_ms;
+    if (timeout_ms == 0) {
+        timeout_ms = RX_IDLE_TIMEOUT_MS;
+    }
+    if (idle_ms < timeout_ms) {
+        return;
+    }
+    send_receiver_progress_summary(true);
+}
+  
+#if CONFIG_MESH_ROOT
+static void root_trigger_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(30000));
+
+    static int stable_counter = 0;
+
+    while (1) {
+        uint32_t sender_ip[FLOW_COUNT];
+uint32_t receiver_ip[FLOW_COUNT];
+
+sender_ip[FLOW_LEFT] = get_ip_by_mac(LEFT_SENDER_MAC);
+receiver_ip[FLOW_LEFT] = get_ip_by_mac(LEFT_RECEIVER_MAC);
+
+sender_ip[FLOW_RIGHT] = get_ip_by_mac(RIGHT_SENDER_MAC);
+receiver_ip[FLOW_RIGHT] = get_ip_by_mac(RIGHT_RECEIVER_MAC);
+
+bool all_ready =
+    sender_ip[FLOW_LEFT] != 0 &&
+    receiver_ip[FLOW_LEFT] != 0 &&
+    sender_ip[FLOW_RIGHT] != 0 &&
+    receiver_ip[FLOW_RIGHT] != 0;
+
+if (!all_ready) {
+    stable_counter = 0;
+
+    printf("[ROOT] fixed MAC nodes not ready yet\n");
+    printf("[ROOT] left_sender=%s left_receiver=%s right_sender=%s right_receiver=%s\n",
+           sender_ip[FLOW_LEFT] ? "OK" : "MISSING",
+           receiver_ip[FLOW_LEFT] ? "OK" : "MISSING",
+           sender_ip[FLOW_RIGHT] ? "OK" : "MISSING",
+           receiver_ip[FLOW_RIGHT] ? "OK" : "MISSING");
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    continue;
+}
+
+stable_counter++;
+
+if (stable_counter < 2) {
+    printf("[ROOT] all fixed MAC nodes found, waiting stable topology (%d/2)\n",
+           stable_counter);
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    continue;
+}
+
+uint32_t current_test_id = next_test_id++;
+stable_counter = 0;
+memset(g_sender_summary, 0, sizeof(g_sender_summary));
+memset(g_best_receiver_summary, 0, sizeof(g_best_receiver_summary));
+memset(sender_summary_received, 0, sizeof(sender_summary_received));
+memset(receiver_summary_received, 0, sizeof(receiver_summary_received));
+memset(last_receiver_packets, 0, sizeof(last_receiver_packets));
+memset(same_receiver_count, 0, sizeof(same_receiver_count));
+memset(last_receiver_progress_us, 0, sizeof(last_receiver_progress_us));
+memset(root_flow_first_seen_us, 0, sizeof(root_flow_first_seen_us));
+memset(root_flow_complete_us, 0, sizeof(root_flow_complete_us));
+ensure_root_in_topology();
+
+test_active = true;
+active_test_id = current_test_id;
+test_start_us = esp_timer_get_time();
+parallel_test_end_us = 0;
+
+for (uint8_t flow = 0; flow < FLOW_COUNT; flow++) {
+
+    trigger_msg_t trig = {0};
+
+    const uint8_t *sender_mac = NULL;
+    const uint8_t *receiver_mac = NULL;
+
+    if (flow == FLOW_LEFT) {
+        sender_mac = LEFT_SENDER_MAC;
+        receiver_mac = LEFT_RECEIVER_MAC;
+    } else {
+        sender_mac = RIGHT_SENDER_MAC;
+        receiver_mac = RIGHT_RECEIVER_MAC;
+    }
+
+    trig.test_id = current_test_id;
+    trig.flow_id = flow;
+    trig.sender_ip = sender_ip[flow];
+    trig.receiver_ip = receiver_ip[flow];
+
+    trig.packet_count = 50;
+    trig.payload_size = 500;
+    trig.send_interval_ms = 10;
+    trig.result_timeout_ms = RX_IDLE_TIMEOUT_MS;
+
+    uint32_t receiver_path_ips[8] = {0};
+    uint8_t receiver_path_len = 0;
+
+    if (build_path_to_mac(sender_mac, trig.path_ips, &trig.path_len) != 0) {
+    printf("[ROOT] failed to build path to sender MAC for flow=%u\n", flow);
+    continue;
+}
+
+    trig.current_hop = 0;
+
+    if (build_path_to_mac(receiver_mac, receiver_path_ips, &receiver_path_len) != 0) {
+    printf("[ROOT] failed to build path to receiver MAC for flow=%u\n", flow);
+    continue;
+}
+
+    int sender_pos_in_receiver_path = -1;
+
+    for (uint8_t i = 0; i < receiver_path_len; i++) {
+        if (receiver_path_ips[i] == trig.sender_ip) {
+            sender_pos_in_receiver_path = i;
+            break;
+        }
+    }
+
+    memset(trig.data_path_ips, 0, sizeof(trig.data_path_ips));
+
+    if (sender_pos_in_receiver_path >= 0) {
+        trig.data_path_len = receiver_path_len - sender_pos_in_receiver_path - 1;
+
+        for (uint8_t i = 0; i < trig.data_path_len; i++) {
+            trig.data_path_ips[i] =
+                receiver_path_ips[sender_pos_in_receiver_path + 1 + i];
+        }
+    } else {
+        trig.data_path_len = receiver_path_len;
+        memcpy(trig.data_path_ips, receiver_path_ips, sizeof(receiver_path_ips));
+    }
+
+    app_msg_t msg = {0};
+    msg.magic = 0x4D455348;
+    msg.type = MSG_TYPE_TRIGGER;
+    msg.src_ip = inet_addr(ROOT_IP);
+
+    if (trig.path_len == 0) {
+        msg.dst_ip = trig.sender_ip;
+    } else {
+        msg.dst_ip = trig.path_ips[0];
+    }
+
+    msg.payload_len = sizeof(trig);
+    memcpy(msg.payload, &trig, sizeof(trig));
+
+    size_t tx_len = app_msg_size(msg.payload_len);
+
+    printf("[ROOT] sending trigger flow=%u\n", flow);
+
+    udp_send_raw(msg.dst_ip, UDP_PORT, &msg, tx_len);
+}
+        uint32_t wait_s = 10;
+
+while (test_active) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+printf("[ROOT] next parallel test in %" PRIu32 " s\n", wait_s);
+vTaskDelay(pdMS_TO_TICKS(wait_s * 1000));
+    }
+}
+#endif
+
+static void print_test_result_if_ready(bool force)
+{
+    
+    if (!am_i_root()) {
+        return;
+    }
+
+    if (!test_active) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    int64_t end_us = parallel_test_end_us;
+
+if (end_us == 0) {
+    end_us = now_us;
+}
+
+int64_t elapsed_ms = (end_us - test_start_us) / 1000;
+
+    bool timeout_reached = (elapsed_ms >= ROOT_RESULT_TIMEOUT_MS);
+
+    bool all_complete = true;
+    bool any_summary = false;
+    bool stagnated = false;
+    for (uint8_t flow = 0; flow < FLOW_COUNT; flow++) {
+
+        if (sender_summary_received[flow] || receiver_summary_received[flow]) {
+            any_summary = true;
+        }
+
+        bool receiver_complete = false;
+
+        if (receiver_summary_received[flow] &&
+            g_best_receiver_summary[flow].expected_packets > 0 &&
+            g_best_receiver_summary[flow].received_packets >=
+            g_best_receiver_summary[flow].expected_packets) {
+
+            receiver_complete = true;
+        }
+
+        if (!(sender_summary_received[flow] && receiver_complete)) {
+            all_complete = false;
+        }
+
+        if (receiver_summary_received[flow]) {
+            int64_t no_progress_ms =
+                (now_us - last_receiver_progress_us[flow]) / 1000;
+
+            if (no_progress_ms >= ROOT_STAGNATION_MS ||
+                same_receiver_count[flow] >= ROOT_SAME_COUNT_LIMIT) {
+
+                stagnated = true;
+            }
+        }
+    }
+
+    bool ready = all_complete || stagnated || timeout_reached;
+
+    if (!force && !ready) {
+        return;
+    }
+
+    printf("\n========== PARALLEL TEST RESULT ==========\n");
+    printf("Test-ID:                 %" PRIu32 "\n", active_test_id);
+
+    if (!any_summary) {
+        printf("Status:                  NO_SUMMARIES\n");
+        printf("Reason:                  No sender/receiver summaries reached root\n");
+    } else {
+
+        float total_goodput_kbps = 0.0f;
+
+        for (uint8_t flow = 0; flow < FLOW_COUNT; flow++) {
+
+            printf("\n--- FLOW %u ---\n", flow);
+            uint32_t sent_packets = 0;
+            uint32_t sent_bytes = 0;
+            uint32_t received_packets = 0;
+            uint32_t received_bytes = 0;
+
+            uint32_t sender_ip_nbo = 0;
+            uint32_t receiver_ip_nbo = 0;
+
+            if (sender_summary_received[flow]) {
+                sent_packets = g_sender_summary[flow].sent_packets;
+                sent_bytes = g_sender_summary[flow].sent_bytes;
+                sender_ip_nbo = g_sender_summary[flow].sender_ip;
+                receiver_ip_nbo = g_sender_summary[flow].receiver_ip;
+            }
+
+            if (receiver_summary_received[flow]) {
+                received_packets = g_best_receiver_summary[flow].received_packets;
+                received_bytes = g_best_receiver_summary[flow].received_bytes;
+                if (sender_ip_nbo == 0) {
+                    sender_ip_nbo = g_best_receiver_summary[flow].sender_ip;
+                }
+
+                if (receiver_ip_nbo == 0) {
+                    receiver_ip_nbo = g_best_receiver_summary[flow].receiver_ip;
+                }
+            }
+
+            struct in_addr s_addr = { .s_addr = sender_ip_nbo };
+            struct in_addr r_addr = { .s_addr = receiver_ip_nbo };
+
+            printf("Sender:                  %s\n", inet_ntoa(s_addr));
+            printf("Receiver:                %s\n", inet_ntoa(r_addr));
+
+            printf("Sender summary:          %s\n",
+                   sender_summary_received[flow] ? "yes" : "no");
+
+            printf("Receiver summary:        %s\n",
+                   receiver_summary_received[flow] ? "yes" : "no");
+
+            printf("Sent packets:            %" PRIu32 "\n", sent_packets);
+            printf("Received packets:        %" PRIu32 "\n", received_packets);
+
+            uint32_t lost_packets = 0;
+            if (sent_packets >= received_packets) {
+                lost_packets = sent_packets - received_packets;
+            }
+
+            float pdr = 0.0f;
+            if (sent_packets > 0) {
+                pdr = ((float)received_packets / (float)sent_packets) * 100.0f;
+            }
+
+            printf("Lost packets:            %" PRIu32 "\n", lost_packets);
+            printf("PDR:                     %.2f %%\n", pdr);
+            printf("Sent bytes:              %" PRIu32 "\n", sent_bytes);
+            printf("Received bytes:          %" PRIu32 "\n", received_bytes);
+
+            float goodput_kbps = 0.0f;
+
+            if (receiver_summary_received[flow]) {
+
+                float duration_ms = 0.0f;
+
+                if (g_best_receiver_summary[flow].last_rx_us >
+                    g_best_receiver_summary[flow].first_rx_us) {
+
+                    duration_ms =
+                        (float)(g_best_receiver_summary[flow].last_rx_us -
+                                g_best_receiver_summary[flow].first_rx_us)
+                        / 1000.0f;
+                }
+
+                if (duration_ms > 0.0f) {
+                    goodput_kbps =
+                        ((float)received_bytes * 8.0f) /
+                        (duration_ms / 1000.0f) / 1000.0f;
+                }
+
+                printf("Receiver duration:       %.2f ms\n", duration_ms);
+                printf("Goodput:                 %.2f kbps\n", goodput_kbps);
+
+            } else {
+                printf("Goodput:                 unknown\n");
+            }
+
+            total_goodput_kbps += goodput_kbps;
+
+            if (flow == FLOW_LEFT) {
+    printf("Logical path:            LEFT_SENDER -> LEFT_RECEIVER\n");
+} else {
+    printf("Logical path:            RIGHT_SENDER -> RIGHT_RECEIVER\n");
+}
+print_flow_mac_path(flow);
+        }
+
+if (receiver_summary_received[FLOW_LEFT] &&
+    receiver_summary_received[FLOW_RIGHT]) {
+
+    int64_t f0_start = root_flow_first_seen_us[FLOW_LEFT];
+    int64_t f0_end   = root_flow_complete_us[FLOW_LEFT];
+
+    int64_t f1_start = root_flow_first_seen_us[FLOW_RIGHT];
+    int64_t f1_end   = root_flow_complete_us[FLOW_RIGHT];
+
+    printf("\n========== PARALLEL ANALYSIS ==========\n");
+
+    printf("Flow0 root window:       %lld -> %lld us\n", f0_start, f0_end);
+    printf("Flow1 root window:       %lld -> %lld us\n", f1_start, f1_end);
+
+    if (f0_start > 0 && f0_end > 0 && f1_start > 0 && f1_end > 0) {
+
+        float f0_duration_ms = (float)(f0_end - f0_start) / 1000.0f;
+        float f1_duration_ms = (float)(f1_end - f1_start) / 1000.0f;
+
+        int64_t overlap_start = (f0_start > f1_start) ? f0_start : f1_start;
+        int64_t overlap_end   = (f0_end   < f1_end)   ? f0_end   : f1_end;
+        int64_t overlap_us = overlap_end - overlap_start;
+
+        printf("Flow0 root duration:     %.2f ms\n", f0_duration_ms);
+        printf("Flow1 root duration:     %.2f ms\n", f1_duration_ms);
+
+        if (overlap_us > 0) {
+            float overlap_ms = (float)overlap_us / 1000.0f;
+
+            uint32_t bytes0 = g_best_receiver_summary[FLOW_LEFT].received_bytes;
+            uint32_t bytes1 = g_best_receiver_summary[FLOW_RIGHT].received_bytes;
+
+            float flow0_rate =
+                ((float)bytes0 * 8.0f) / (f0_duration_ms / 1000.0f) / 1000.0f;
+
+            float flow1_rate =
+                ((float)bytes1 * 8.0f) / (f1_duration_ms / 1000.0f) / 1000.0f;
+
+            float cellrate_kbps =
+                ((float)(bytes0 + bytes1) * 8.0f) /
+                (overlap_ms / 1000.0f) / 1000.0f;
+
+            printf("Overlap:                 %.2f ms\n", overlap_ms);
+            printf("PARALLEL:                YES\n");
+            printf("Flow0 root rate:         %.2f kbps\n", flow0_rate);
+            printf("Flow1 root rate:         %.2f kbps\n", flow1_rate);
+            printf("CELL RATE parallel:      %.2f kbps\n", cellrate_kbps);
+
+        } else {
+            printf("Overlap:                 0.00 ms\n");
+            printf("PARALLEL:                NO\n");
+            printf("CELL RATE parallel:      not valid\n");
+        }
+
+    } else {
+        printf("PARALLEL:                UNKNOWN\n");
+        printf("Reason:                  at least one flow did not complete\n");
+    }
+
+    printf("======================================\n");
+}
+
+        if (all_complete) {
+            printf("Status:                  COMPLETE_PARALLEL\n");
+        } else if (stagnated) {
+            printf("Status:                  STAGNATED_PARTIAL\n");
+        } else if (timeout_reached) {
+            printf("Status:                  TIMEOUT_PARTIAL\n");
+        }
+    }
+
+    printf("==========================================\n\n");
+
+    test_active = false;
+    active_test_id = 0;
+
+    memset(g_sender_summary, 0, sizeof(g_sender_summary));
+    memset(g_best_receiver_summary, 0, sizeof(g_best_receiver_summary));
+    memset(sender_summary_received, 0, sizeof(sender_summary_received));
+    memset(receiver_summary_received, 0, sizeof(receiver_summary_received));
+    memset(last_receiver_packets, 0, sizeof(last_receiver_packets));
+    memset(same_receiver_count, 0, sizeof(same_receiver_count));
+    memset(last_receiver_progress_us, 0, sizeof(last_receiver_progress_us));
+memset(root_flow_first_seen_us, 0, sizeof(root_flow_first_seen_us));
+memset(root_flow_complete_us, 0, sizeof(root_flow_complete_us));
+}
+
+static void udp_rx_task(void *arg)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "RX socket failed: errno=%d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    struct timeval tv = {
+        .tv_sec = 0,
+        .tv_usec = 200000
+    };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in listen_addr = {0};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_port = htons(UDP_PORT);
+    listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, (struct sockaddr *)&listen_addr,
+    sizeof(listen_addr)) < 0) {
+        ESP_LOGE(TAG, "bind failed: errno=%d", errno);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "UDP RX listening on port %d", UDP_PORT);
+    while (1) {
+        print_test_result_if_ready(false);
+        try_send_receiver_summary_on_timeout();
+        struct sockaddr_in source_addr = {0};
+        socklen_t socklen = sizeof(source_addr);
+        app_msg_t msg = {0};
+        int len = recvfrom(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&source_addr, &socklen);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            ESP_LOGE(TAG, "recvfrom failed: errno=%d", errno);
+            continue;
+        }
+        if (msg.magic != 0x4D455348) {
+            continue;
+        }
+	uint32_t my_ip = get_my_ip_nbo();
+        if (msg.type == MSG_TYPE_TRIGGER) {
+    if (my_ip != msg.dst_ip) {
+        continue;
+    }
+            trigger_msg_t trig = {0};
+            if (msg.payload_len < sizeof(trig)) {
+                printf("[WARN] TRIGGER payload too small: %u\n", msg.payload_len);
+                continue;
+            }
+            memcpy(&trig, msg.payload, sizeof(trig));
+            uint32_t root_ip_from_trigger = msg.src_ip;
+	    if (trig.path_len > 0 && trig.current_hop < (trig.path_len - 1)) {
+    trig.current_hop++;
+    app_msg_t fwd_msg = {0};
+    fwd_msg.magic = 0x4D455348;
+    fwd_msg.type = MSG_TYPE_TRIGGER;
+    fwd_msg.src_ip = msg.src_ip;
+    fwd_msg.dst_ip = trig.path_ips[trig.current_hop];
+    fwd_msg.payload_len = sizeof(trig);
+    memcpy(fwd_msg.payload, &trig, sizeof(trig));
+    size_t fwd_len = app_msg_size(fwd_msg.payload_len);
+    udp_send_raw(fwd_msg.dst_ip, UDP_PORT, &fwd_msg, fwd_len);
+    continue;
+}
+            sender_summary_t summary = {0};
+            summary.test_id = trig.test_id;
+            summary.flow_id = trig.flow_id;
+            summary.sender_ip = trig.sender_ip;
+            summary.receiver_ip = trig.receiver_ip;
+            summary.packet_count = trig.packet_count;
+            summary.payload_size = trig.payload_size;
+            summary.send_start_us = esp_timer_get_time();
+int burst_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+if (burst_sock < 0) {
+    ESP_LOGE(TAG, "burst socket failed: errno=%d", errno);
+    continue;
+}
+            for (uint16_t i = 0; i < trig.packet_count; i++) {
+                app_msg_t data_msg = {0};
+data_header_t dh = {0};
+data_msg.magic = 0x4D455348;
+data_msg.type = MSG_TYPE_DATA;
+data_msg.seq = i + 1;
+data_msg.src_ip = trig.sender_ip;
+dh.test_id = trig.test_id;
+dh.flow_id = trig.flow_id;
+dh.expected_packets = trig.packet_count;
+dh.payload_size = trig.payload_size;
+dh.seq = i + 1;
+dh.root_ip = root_ip_from_trigger;
+dh.result_timeout_ms = trig.result_timeout_ms;
+dh.path_len = trig.data_path_len;
+memset(dh.path_ips, 0, sizeof(dh.path_ips));
+memcpy(dh.path_ips, trig.data_path_ips, sizeof(trig.data_path_ips));
+uint32_t data_dst_ip = trig.receiver_ip;
+if (trig.data_path_len > 0) {
+    data_dst_ip = trig.data_path_ips[0];
+
+    if (data_dst_ip == trig.sender_ip && trig.data_path_len > 1) {
+        data_dst_ip = trig.data_path_ips[1];
+        dh.current_hop = 1;
+    } else {
+        dh.current_hop = 0;
+    }
+} else {
+    dh.current_hop = 0;
+}
+data_msg.dst_ip = data_dst_ip;
+size_t app_payload_size = trig.payload_size;
+size_t total_payload_size = sizeof(dh) + app_payload_size;
+if (total_payload_size > sizeof(data_msg.payload)) {
+    app_payload_size = sizeof(data_msg.payload) - sizeof(dh);
+    total_payload_size = sizeof(dh) + app_payload_size;
+}
+data_msg.payload_len = total_payload_size;
+memcpy(data_msg.payload, &dh, sizeof(dh));
+memset(data_msg.payload + sizeof(dh), 'A' + (i % 26), app_payload_size);
+size_t tx_len = app_msg_size(data_msg.payload_len);
+if (udp_send_raw_with_sock(burst_sock, data_dst_ip, UDP_PORT, &data_msg, tx_len) == 0) {
+    summary.sent_packets++;
+    summary.sent_bytes += app_payload_size;
+}
+                if (trig.send_interval_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(trig.send_interval_ms));
+}
+            }
+            close(burst_sock);
+            summary.send_end_us = esp_timer_get_time();
+            app_msg_t summary_msg = {0};
+summary_msg.magic = 0x4D455348;
+summary_msg.type = MSG_TYPE_SENDER_SUMMARY;
+summary_msg.src_ip = trig.sender_ip;
+summary_msg.dst_ip = root_ip_from_trigger;
+summary_msg.payload_len = sizeof(summary);
+memcpy(summary_msg.payload, &summary, sizeof(summary));
+size_t tx_len = app_msg_size(summary_msg.payload_len);
+for (int k = 0; k < 3; k++) {
+    udp_send_raw(root_ip_from_trigger, UDP_PORT, &summary_msg, tx_len);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+            continue;
+        }
+        if (msg.type == MSG_TYPE_DATA) {
+            if (my_ip != msg.dst_ip) {
+                continue;
+            }
+            if (msg.payload_len < sizeof(data_header_t)) {
+                printf("[WARN] DATA payload too small: %u\n", msg.payload_len);
+                continue;
+            }
+            data_header_t dh = {0};
+            memcpy(&dh, msg.payload, sizeof(dh));
+                
+            if (dh.path_len > 0 && dh.current_hop < (dh.path_len - 1)) {
+    dh.current_hop++;
+    app_msg_t fwd_msg = msg;
+    fwd_msg.dst_ip = dh.path_ips[dh.current_hop];
+    memcpy(fwd_msg.payload, &dh, sizeof(dh));
+    size_t fwd_len = app_msg_size(fwd_msg.payload_len);
+    udp_send_raw(fwd_msg.dst_ip, UDP_PORT, &fwd_msg, fwd_len);
+    continue;
+}
+            size_t app_payload_size = msg.payload_len - sizeof(dh);
+            int64_t now_us = esp_timer_get_time();
+            if (!g_rx_state.active ||
+    g_rx_state.test_id != dh.test_id ||
+    g_rx_state.flow_id != dh.flow_id) {
+                reset_receiver_state();
+
+                g_rx_state.active = true;
+                g_rx_state.summary_sent = false;
+                g_rx_state.test_id = dh.test_id;
+g_rx_state.flow_id = dh.flow_id;
+g_rx_state.sender_ip = msg.src_ip;
+g_rx_state.receiver_ip = my_ip;
+                g_rx_state.root_ip = dh.root_ip;
+                g_rx_state.expected_packets = dh.expected_packets;
+                g_rx_state.payload_size = dh.payload_size;
+                g_rx_state.result_timeout_ms = dh.result_timeout_ms;
+if (g_rx_state.result_timeout_ms == 0) {
+    g_rx_state.result_timeout_ms = RX_IDLE_TIMEOUT_MS;
+}
+                g_rx_state.received_packets = 0;
+                g_rx_state.received_bytes = 0;
+                g_rx_state.first_rx_us = now_us;
+                g_rx_state.last_rx_us = now_us;
+                g_rx_state.last_progress_report_us = now_us;
+            }
+            if (g_rx_state.received_packets == 0) {
+                g_rx_state.first_rx_us = now_us;
+            }
+            g_rx_state.last_rx_us = now_us;
+            g_rx_state.received_packets++;
+            g_rx_state.received_bytes += app_payload_size;
+
+            if (!g_rx_state.summary_sent &&
+    g_rx_state.expected_packets > 0 &&
+    g_rx_state.received_packets >= g_rx_state.expected_packets) {
+    send_receiver_progress_summary(true);    
+	}
+            continue;
+        }
+        if (msg.type == MSG_TYPE_TOPO_REPLY) {
+    if (!am_i_root()) {
+        continue;
+    }
+    topo_reply_t reply = {0};
+    if (msg.payload_len < sizeof(reply)) {
+        printf("[WARN] TOPO_REPLY payload too small: %u\n", msg.payload_len);
+        continue;
+    }
+    memcpy(&reply, msg.payload, sizeof(reply));
+    {
+    struct in_addr ip_addr = { .s_addr = reply.node_ip };
+    printf("[ROOT-TOPO] got node=%s level=%u mac=" MACSTR " parent=" MACSTR "\n",
+           inet_ntoa(ip_addr),
+           reply.level,
+           MAC2STR(reply.node_mac),
+           MAC2STR(reply.parent_bssid));
+}
+    int idx = find_topology_index_by_mac(reply.node_mac);
+    if (idx < 0 && g_topology_count < 32) {
+        idx = (int)g_topology_count++;
+    }
+    if (idx >= 0) {
+        g_topology[idx].valid = true;
+        g_topology[idx].ip = reply.node_ip;
+        memcpy(g_topology[idx].mac, reply.node_mac, 6);
+        memcpy(g_topology[idx].parent_bssid, reply.parent_bssid, 6);
+        g_topology[idx].level = reply.level;
+        g_topology[idx].parent_rssi = reply.parent_rssi;
+    }
+    continue;
+}
+        if (msg.type == MSG_TYPE_SENDER_SUMMARY) {
+            if (!am_i_root()) {
+                continue;
+            }
+            sender_summary_t summary = {0};
+            if (msg.payload_len < sizeof(summary)) {
+                printf("[WARN] SENDER_SUMMARY payload too small: %u\n", msg.payload_len);
+                continue;
+            }
+            memcpy(&summary, msg.payload, sizeof(summary));
+            if (summary.test_id != active_test_id) {
+                continue;
+            }
+            if (summary.flow_id >= FLOW_COUNT) {
+    continue;
+}
+
+uint8_t flow = summary.flow_id;
+
+g_sender_summary[flow] = summary;
+sender_summary_received[flow] = true;
+
+printf("[ROOT] sender summary received test_id=%" PRIu32
+       " flow=%u packets=%" PRIu32 "\n",
+       summary.test_id,
+       flow,
+       summary.sent_packets);
+            continue;
+        }
+        if (msg.type == MSG_TYPE_RECEIVER_SUMMARY) {
+            if (!am_i_root()) {
+                continue;
+            }
+            receiver_summary_t summary = {0};
+            if (msg.payload_len < sizeof(summary)) {
+                printf("[WARN] RECEIVER_SUMMARY payload too small: %u\n", msg.payload_len);
+                continue;
+            }
+            memcpy(&summary, msg.payload, sizeof(summary));
+            if (summary.test_id != active_test_id) {
+                continue;
+            }
+int64_t now_us = esp_timer_get_time();
+if (summary.flow_id >= FLOW_COUNT) {
+    continue;
+}
+
+uint8_t flow = summary.flow_id;
+
+if (root_flow_first_seen_us[flow] == 0) {
+    root_flow_first_seen_us[flow] = test_start_us;
+}
+
+if (!receiver_summary_received[flow] ||
+    summary.received_packets > g_best_receiver_summary[flow].received_packets) {
+    root_flow_complete_us[flow] = now_us;
+}
+
+if (!receiver_summary_received[flow]) {
+    receiver_summary_received[flow] = true;
+    g_best_receiver_summary[flow] = summary;
+    last_receiver_packets[flow] = summary.received_packets;
+    last_receiver_progress_us[flow] = now_us;
+    same_receiver_count[flow] = 0;
+} else {
+    if (summary.received_packets > g_best_receiver_summary[flow].received_packets) {
+        g_best_receiver_summary[flow] = summary;
+        last_receiver_packets[flow] = summary.received_packets;
+        last_receiver_progress_us[flow] = now_us;
+        same_receiver_count[flow] = 0;
+    } else if (summary.received_packets == last_receiver_packets[flow]) {
+        same_receiver_count[flow]++;
+        last_receiver_progress_us[flow] = now_us;
+    }
+}
+
+printf("[ROOT] receiver summary received test_id=%" PRIu32
+       " flow=%u packets=%" PRIu32 "/%u same=%" PRIu32 "\n",
+       summary.test_id,
+       flow,
+       summary.received_packets,
+       summary.expected_packets,
+       same_receiver_count[flow]);
+if (receiver_summary_received[FLOW_LEFT] &&
+    receiver_summary_received[FLOW_RIGHT] &&
+    root_flow_complete_us[FLOW_LEFT] > 0 &&
+    root_flow_complete_us[FLOW_RIGHT] > 0 &&
+    parallel_test_end_us == 0) {
+
+    parallel_test_end_us =
+        (root_flow_complete_us[FLOW_LEFT] > root_flow_complete_us[FLOW_RIGHT]) ?
+        root_flow_complete_us[FLOW_LEFT] :
+        root_flow_complete_us[FLOW_RIGHT];
+}
+            continue;
+        }
+    }
+}
+
+static esp_err_t esp_storage_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
+
+static void wifi_init(void)
+{
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0x0, sizeof(wifi_config_t));
+    esp_bridge_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    wifi_config_t wifi_softap_config = { 
+.ap = {
+.ssid = CONFIG_BRIDGE_SOFTAP_SSID,
+.password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
+.channel = CONFIG_MESH_CHANNEL,
+},
+};
+esp_bridge_wifi_set_config(WIFI_IF_AP, &wifi_softap_config);
+}
+void app_wifi_set_softap_info(void)
+{
+    char softap_ssid[33];
+    char softap_psw[64];
+    uint8_t softap_mac[6];
+    size_t ssid_size = sizeof(softap_ssid);
+    size_t psw_size = sizeof(softap_psw);
+    esp_wifi_get_mac(WIFI_IF_AP, softap_mac);
+    memset(softap_ssid, 0x0, sizeof(softap_ssid));
+    memset(softap_psw, 0x0, sizeof(softap_psw));
+    if (esp_mesh_lite_get_softap_ssid_from_nvs(softap_ssid, &ssid_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Get ssid from nvs: %s", softap_ssid);
+    } else {
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
+        snprintf(softap_ssid, sizeof(softap_ssid), "%.25s_%02x%02x%02x", CONFIG_BRIDGE_SOFTAP_SSID, softap_mac[3], softap_mac[4], softap_mac[5]);
+#else
+        snprintf(softap_ssid, sizeof(softap_ssid), "%.32s", CONFIG_BRIDGE_SOFTAP_SSID);
+#endif
+        ESP_LOGI(TAG, "Get ssid from nvs failed, set ssid: %s", softap_ssid);
+    }
+    if (esp_mesh_lite_get_softap_psw_from_nvs(softap_psw, &psw_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Get psw from nvs: [HIDDEN]");
+    } else {
+        strlcpy(softap_psw, CONFIG_BRIDGE_SOFTAP_PASSWORD, sizeof(softap_psw));
+        ESP_LOGI(TAG, "Get psw from nvs failed, set psw: [HIDDEN]");
+    }
+    esp_mesh_lite_set_softap_info(softap_ssid, softap_psw);
+}
+
+void app_main()
+{
+    esp_log_level_set("*", ESP_LOG_INFO);
+    ESP_ERROR_CHECK(esp_storage_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_bridge_create_all_netif();
+    wifi_init();
+    esp_mesh_lite_config_t mesh_lite_config = ESP_MESH_LITE_DEFAULT_INIT();
+    mesh_lite_config.join_mesh_ignore_router_status = true;
+#if CONFIG_MESH_ROOT
+    mesh_lite_config.join_mesh_without_configured_wifi = false;
+#else
+    mesh_lite_config.join_mesh_without_configured_wifi = true;
+#endif
+    esp_mesh_lite_init(&mesh_lite_config);
+    app_wifi_set_softap_info();
+#if CONFIG_MESH_ROOT
+    ESP_LOGI(TAG, "Root node");
+    esp_mesh_lite_set_allowed_level(1);
+#else
+    ESP_LOGI(TAG, "Child node");
+    esp_mesh_lite_set_disallowed_level(1);
+#endif
+    esp_mesh_lite_start();
+
+    TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS,true, NULL, print_system_info_timercb);
+xTimerStart(timer, 0);
+xTaskCreate(udp_rx_task, "udp_rx", 8192, NULL, 5, NULL);
+#if CONFIG_MESH_ROOT
+xTaskCreate(root_trigger_task, "root_trigger", 4096, NULL, 5,NULL);
+#endif
+}

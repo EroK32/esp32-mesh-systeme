@@ -83,16 +83,29 @@ struct ReceiverState {
 };
 
 ReceiverState rx;
+bool sendActive = false;
+uint32_t sendRoot = 0;
+uint32_t sendTestId = 0;
+uint32_t sendSender = 0;
+uint32_t sendReceiver = 0;
+uint16_t sendPackets = 0;
+uint16_t sendPayloadSize = 0;
+uint16_t sendInterval = 0;
+uint16_t sendSeq = 1;
+
+SenderSummary activeSenderSummary;
 
 void rootTriggerTask();
 void printTopologyTask();
 void rootAnnounceTask();
+void sendPacketTask();
 void printResultIfReady(bool force);
 void sendReceiverSummary(bool finalSummary);
 
 Task tRootTrigger(ROOT_START_DELAY_MS, TASK_ONCE, &rootTriggerTask);
 Task tTopology(TOPO_PRINT_MS, TASK_FOREVER, &printTopologyTask);
 Task tRootAnnounce(ROOT_ANNOUNCE_MS, TASK_FOREVER, &rootAnnounceTask);
+Task tSendPacket(SEND_INTERVAL_MS, TASK_FOREVER, &sendPacketTask);
 
 String makePayload(uint16_t len, uint16_t seq) {
   String p;
@@ -210,74 +223,95 @@ void rootTriggerTask() {
 }
 
 void startSending(JsonDocument &doc) {
-  uint32_t testId = doc["test_id"];
-  uint32_t root = doc["root"];
-  uint32_t sender = doc["sender"];
-  uint32_t receiver = doc["receiver"];
-  uint16_t packets = doc["packets"];
-  uint16_t payloadSize = doc["payload"];
-  uint16_t interval = doc["interval"];
+  sendTestId = doc["test_id"];
+  sendRoot = doc["root"];
+  sendSender = doc["sender"];
+  sendReceiver = doc["receiver"];
+  sendPackets = doc["packets"];
+  sendPayloadSize = doc["payload"];
+  sendInterval = doc["interval"];
+  sendSeq = 1;
+  sendActive = true;
+
+  activeSenderSummary = SenderSummary();
+  activeSenderSummary.testId = sendTestId;
+  activeSenderSummary.sender = sendSender;
+  activeSenderSummary.receiver = sendReceiver;
+  activeSenderSummary.packetCount = sendPackets;
+  activeSenderSummary.payloadSize = sendPayloadSize;
+  activeSenderSummary.startMs = millis();
 
   Serial.println();
-  Serial.printf("[SENDER] trigger received test_id=%u receiver=%u packets=%u payload=%u\n",
-                testId, receiver, packets, payloadSize);
+  Serial.printf(
+      "[SENDER] trigger received test_id=%u receiver=%u packets=%u payload=%u\n",
+      sendTestId, sendReceiver, sendPackets, sendPayloadSize);
 
-  SenderSummary s;
-  s.testId = testId;
-  s.sender = sender;
-  s.receiver = receiver;
-  s.packetCount = packets;
-  s.payloadSize = payloadSize;
-  s.startMs = millis();
+  tSendPacket.setInterval(sendInterval > 0 ? sendInterval : 1);
+  sendPacketTask();              
+  tSendPacket.restartDelayed();  
+}
 
-  for (uint16_t i = 1; i <= packets; i++) {
-    StaticJsonDocument<2200> data;
-    data["type"] = "DATA";
-    data["test_id"] = testId;
-    data["root"] = root;
-    data["sender"] = sender;
-    data["receiver"] = receiver;
-    data["seq"] = i;
-    data["expected"] = packets;
-    data["payload_size"] = payloadSize;
-    data["data"] = makePayload(payloadSize, i);
-
-    String out;
-    serializeJson(data, out);
-
-    bool ok = mesh.sendSingle(receiver, out);
-    if (ok) {
-      s.sentPackets++;
-      s.sentBytes += payloadSize;
-    }
-    if (i == 1 || i % 10 == 0 || i == packets) {
-      Serial.printf("[SENDER] DATA seq=%u/%u -> receiver=%u send=%s\n",
-                    i, packets, receiver, ok ? "OK" : "FAIL");
-    }
-    delay(interval);
-    mesh.update();
+void sendPacketTask() {
+  if (!sendActive) {
+    tSendPacket.disable();
+    return;
   }
 
-  s.endMs = millis();
+  StaticJsonDocument<2200> data;
+  data["type"] = "DATA";
+  data["test_id"] = sendTestId;
+  data["root"] = sendRoot;
+  data["sender"] = sendSender;
+  data["receiver"] = sendReceiver;
+  data["seq"] = sendSeq;
+  data["expected"] = sendPackets;
+  data["payload_size"] = sendPayloadSize;
+  data["data"] = makePayload(sendPayloadSize, sendSeq);
 
-  StaticJsonDocument<256> summary;
-  summary["type"] = "SENDER_SUMMARY";
-  summary["test_id"] = s.testId;
-  summary["sender"] = s.sender;
-  summary["receiver"] = s.receiver;
-  summary["packets"] = s.packetCount;
-  summary["payload"] = s.payloadSize;
-  summary["sent_packets"] = s.sentPackets;
-  summary["sent_bytes"] = s.sentBytes;
-  summary["start"] = s.startMs;
-  summary["end"] = s.endMs;
+  String out;
+  serializeJson(data, out);
 
-  for (uint8_t i = 1; i <= 3; i++) {
-    sendJson(root, summary);
-    Serial.printf("[SENDER] summary -> root=%u repeat=%u\n", root, i);
-    delay(20);
-    mesh.update();
+  bool ok = mesh.sendSingle(sendReceiver, out);
+
+  if (ok) {
+    activeSenderSummary.sentPackets++;
+    activeSenderSummary.sentBytes += sendPayloadSize;
   }
+
+  if (sendSeq == 1 || sendSeq % 10 == 0 || sendSeq == sendPackets) {
+    Serial.printf(
+        "[SENDER] DATA seq=%u/%u -> receiver=%u send=%s\n",
+        sendSeq, sendPackets, sendReceiver, ok ? "OK" : "FAIL");
+  }
+
+  if (sendSeq >= sendPackets) {
+    activeSenderSummary.endMs = millis();
+    sendActive = false;
+    tSendPacket.disable();
+
+    StaticJsonDocument<256> summary;
+    summary["type"] = "SENDER_SUMMARY";
+    summary["test_id"] = activeSenderSummary.testId;
+    summary["sender"] = activeSenderSummary.sender;
+    summary["receiver"] = activeSenderSummary.receiver;
+    summary["packets"] = activeSenderSummary.packetCount;
+    summary["payload"] = activeSenderSummary.payloadSize;
+    summary["sent_packets"] = activeSenderSummary.sentPackets;
+    summary["sent_bytes"] = activeSenderSummary.sentBytes;
+    summary["start"] = activeSenderSummary.startMs;
+    summary["end"] = activeSenderSummary.endMs;
+
+    for (uint8_t i = 1; i <= 3; i++) {
+      sendJson(sendRoot, summary);
+      Serial.printf(
+          "[SENDER] summary -> root=%u repeat=%u\n",
+          sendRoot, i);
+    }
+
+    return;
+  }
+
+  sendSeq++;
 }
 
 void handleData(JsonDocument &doc) {
@@ -311,8 +345,11 @@ void handleData(JsonDocument &doc) {
 
   if (rx.receivedPackets == 0) rx.firstRxMs = now;
   rx.lastRxMs = now;
-  rx.receivedPackets++;
-  rx.receivedBytes += strlen(data);
+rx.receivedPackets++;
+rx.receivedBytes += strlen(data);
+
+rx.summarySent = false;
+rx.lastProgressMs = now;
 
   if (seq == 1 || seq % 10 == 0 || seq == expected) {
     Serial.printf("[RECEIVER] DATA seq=%u packets=%u/%u bytes=%u\n",
@@ -428,9 +465,9 @@ void printResultIfReady(bool force) {
   bool timeout = elapsed >= ROOT_RESULT_TIMEOUT_MS;
   bool receiverComplete = receiverSummaryReceived &&
                           receiverSummary.receivedPackets >= receiverSummary.expectedPackets;
-  bool stagnated = receiverSummaryReceived &&
-                   ((now - lastReceiverProgressMs) >= ROOT_STAGNATION_MS ||
-                    sameReceiverCount >= ROOT_SAME_COUNT_LIMIT);
+  bool stagnated = senderSummaryReceived &&
+                 receiverSummaryReceived &&
+                 (now - lastReceiverRealProgressMs >= RX_IDLE_TIMEOUT_MS);
   bool complete = senderSummaryReceived && receiverComplete;
 
   if (!force && !timeout && !stagnated && !complete) return;
@@ -573,6 +610,8 @@ void setup() {
 
   scheduler.addTask(tTopology);
   tTopology.enable();
+  scheduler.addTask(tSendPacket);
+  tSendPacket.disable();
 
   if (ROLE_ROOT) {
     scheduler.addTask(tRootAnnounce);
